@@ -1,0 +1,4 @@
+-keepattributes *Annotation*, InnerClasses
+-dontnote kotlinx.serialization.**
+-keepclassmembers class com.qingke.schedule.** { *** Companion; }
+-keepclasseswithmembers class com.qingke.schedule.** { kotlinx.serialization.KSerializer serializer(...); }

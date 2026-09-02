@@ -1,0 +1,9 @@
+#!/bin/sh
+# 统一构建入口。
+# 本机开发环境：JDK 17 是 keg-only，未在 PATH 上，如果路径存在则自动设置。
+# 其他环境：如果路径不存在，将沿用系统既有的 JAVA_HOME 或 PATH 中的 java。
+HOMEBREW_JDK_PATH="/opt/homebrew/opt/openjdk@17"
+if [ -d "$HOMEBREW_JDK_PATH" ]; then
+  export JAVA_HOME="$HOMEBREW_JDK_PATH"
+fi
+exec "$(dirname "$0")/gradlew" "$@"

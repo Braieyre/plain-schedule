@@ -1,0 +1,15 @@
+local.properties
+.gradle/
+build/
+*.jks
+*.keystore
+.idea/
+.DS_Store
+.kotlin/
+*.apk
+target-function/
+.agent/
+.claude/
+
+# 个人真实课表，仅本地保留，不入库
+*课表.pdf
