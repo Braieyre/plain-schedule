@@ -55,9 +55,16 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.qingke.schedule.WeekMath
@@ -588,8 +595,11 @@ private fun layoutDayCells(cells: List<Pair<Course, Boolean>>): List<LaidCourse>
 
 /**
  * 课程卡片：顶部一条细色带（本周课）或「非本周」灰色角标（非本周课），
- * 下面是课名（自动折行、超出截断）+ 底部一行 marker@room。
+ * 下面是课名 + 学时标记（自动折行、超出截断），底部是教室行。
  * 外层 clip 到圆角形状，即使文字算多了溢出卡片高度也只会被裁掉，不会画出到相邻卡片上。
+ *
+ * 教室是每天都要看的信息，所以在版面上优先级最高：标记跟课名走（课名可多行，挤得起），
+ * 教室独占底部一行并先拿到自己的高度（见 [RoomLine] 与课名的 `weight(fill = false)`）。
  */
 @Composable
 private fun CourseCard(
@@ -633,36 +643,144 @@ private fun CourseCard(
                 )
             }
         }
-        // 文字块占满色条以下的剩余高度并垂直居中，短课名不会堆在卡片顶部。
-        Column(
-            modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 3.dp, vertical = 5.dp),
-            verticalArrangement = Arrangement.Center,
-        ) {
+        CardText(
+            name = course.displayName,
+            room = course.room,
+            color = fg,
+            nameMaxLines = (span * 3).coerceIn(3, 9),
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 2.dp, vertical = 5.dp),
+        )
+    }
+}
+
+/** 教室行的候选字号，从大到小试排。 */
+private val RoomSizeSteps = listOf(9.sp, 8.5.sp, 8.sp, 7.5.sp, 7.sp)
+
+/** 教室行最多铺几行；再多整张卡片就成一堵字墙了。 */
+private const val RoomMaxLines = 4
+
+/** 行高相对字号的倍率。试排和真正渲染必须用同一个值，否则量准了也会画溢出。 */
+private const val RoomLineHeightRatio = 1.28f
+
+/** 课名字号与行高，[CardText] 量高度时也要按它给课名留一行。 */
+private val NameFontSize = 12.sp
+private val NameLineHeight = 15.sp
+
+/** 教室行的排版方案：最终显示成什么字串、多大字号、最多几行。 */
+private data class RoomPlan(val text: String, val size: TextUnit, val maxLines: Int)
+
+/**
+ * 卡片的文字块：课名（含学时标记）在上，教室在下。
+ *
+ * 教室是每天真正要看的信息——课名忘了能猜，教室号猜不出来——所以版面上它优先级最高：
+ * 先按真实格宽算出教室的排法（[planRoom]），课名再用 `weight(fill = false)` 吃剩下的高度。
+ * 反过来（课名先量、教室捡漏）就是老版本把教室整行顶出卡片的原因。
+ */
+@Composable
+private fun CardText(
+    name: String,
+    room: String,
+    color: Color,
+    nameMaxLines: Int,
+    modifier: Modifier,
+) {
+    BoxWithConstraints(modifier) {
+        val measurer = rememberTextMeasurer()
+        val density = LocalDensity.current
+        val widthPx = constraints.maxWidth
+        val heightPx = if (constraints.hasBoundedHeight) constraints.maxHeight else Int.MAX_VALUE
+        val spacerPx = with(density) { 2.dp.roundToPx() }
+        // 给课名留一行，剩下的高度全部可以给教室。
+        val nameLinePx = with(density) { NameLineHeight.toPx() }.toInt()
+
+        val plan = remember(room, widthPx, heightPx, density.density, density.fontScale) {
+            if (room.isBlank()) {
+                null
+            } else {
+                planRoom(
+                    measurer = measurer,
+                    room = room,
+                    widthPx = widthPx,
+                    heightBudgetPx = (heightPx - spacerPx - nameLinePx).coerceAtLeast(0),
+                    density = density,
+                )
+            }
+        }
+
+        Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
             Text(
-                text = course.name,
-                fontSize = 12.sp,
-                lineHeight = 15.sp,
+                // 学时标记跟课名走：课名本来就能折行，多一个 ★ 挤得起；
+                // 放在教室行则要白白吃掉一个全角字宽，窄屏上正是它把教室挤成 "XX-…" 的。
+                text = name,
+                fontSize = NameFontSize,
+                lineHeight = NameLineHeight,
                 fontWeight = FontWeight.Medium,
-                color = fg,
+                color = color,
                 textAlign = TextAlign.Center,
-                maxLines = (span * 3).coerceIn(3, 9),
+                maxLines = nameMaxLines,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().weight(1f, fill = false),
             )
-            val tail = listOf(course.marker, course.room).filter { it.isNotBlank() }.joinToString(" ")
-            if (tail.isNotEmpty()) {
+            if (plan != null) {
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    text = tail,
-                    fontSize = 9.sp,
-                    lineHeight = 11.5.sp,
-                    color = fg.copy(alpha = 0.9f),
+                    text = plan.text,
+                    fontSize = plan.size,
+                    lineHeight = plan.size * RoomLineHeightRatio,
+                    color = color.copy(alpha = 0.9f),
                     textAlign = TextAlign.Center,
-                    maxLines = 1,
+                    maxLines = plan.maxLines,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
         }
     }
+}
+
+/**
+ * 给教室行挑一个「一定落得了地」的排法。
+ *
+ * 一格的可用宽度只有 30–40dp（屏越窄越少），`sp` 还会跟着系统字体大小放大，
+ * 所以不存在一个写死的字号能通吃所有机型——只能拿真实宽度去量。分两轮：
+ *
+ * 1. 字号从大到小试，能把**整串**教室放下就放整串；行数按剩余高度算，最多 [RoomMaxLines] 行。
+ * 2. 整串怎么都放不下时（超长中文场地名 + 窄屏 + 大字体），**保尾不保头**：
+ *    取能放下的最长后缀，前面补省略号。教室的区分度在尾部——同一栋楼的房间共享 "XX-" 前缀，
+ *    截成 "XX-…" 等于什么都没说，截成 "…427" 还能照着找到教室。
+ *    后缀退到 1 个字符总能放下，所以这一轮一定有结果。
+ */
+private fun planRoom(
+    measurer: TextMeasurer,
+    room: String,
+    widthPx: Int,
+    heightBudgetPx: Int,
+    density: Density,
+): RoomPlan {
+    fun lineBudget(size: TextUnit): Int {
+        val lineHeightPx = with(density) { (size * RoomLineHeightRatio).toPx() }
+        if (lineHeightPx <= 0f) return 1
+        return (heightBudgetPx / lineHeightPx).toInt().coerceIn(1, RoomMaxLines)
+    }
+
+    fun fits(text: String, size: TextUnit, maxLines: Int): Boolean = !measurer.measure(
+        text = text,
+        style = TextStyle(fontSize = size, lineHeight = size * RoomLineHeightRatio),
+        maxLines = maxLines,
+        constraints = Constraints(maxWidth = widthPx),
+    ).hasVisualOverflow
+
+    for (size in RoomSizeSteps) {
+        val lines = lineBudget(size)
+        if (fits(room, size, lines)) return RoomPlan(room, size, lines)
+    }
+
+    val size = RoomSizeSteps.last()
+    val lines = lineBudget(size)
+    for (keep in room.length - 1 downTo 1) {
+        val candidate = "…" + room.takeLast(keep)
+        if (fits(candidate, size, lines)) return RoomPlan(candidate, size, lines)
+    }
+    // 宽度小到连一个字都摆不下（理论兜底）：交给 Text 自己截，至少不会崩。
+    return RoomPlan(room, size, lines)
 }
