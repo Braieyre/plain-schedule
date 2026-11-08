@@ -74,6 +74,8 @@ import android.net.Uri
 import com.qingke.schedule.WeekMath
 import com.qingke.schedule.model.Course
 import com.qingke.schedule.model.FlexCourse
+import com.qingke.schedule.transfer.ScheduleArchive
+import com.qingke.schedule.transfer.ScheduleTransfer
 import com.qingke.schedule.model.ParseResult
 import com.qingke.schedule.model.PdfUnsupportedException
 import kotlinx.coroutines.CancellationException
@@ -97,13 +99,20 @@ private sealed interface ImportStep {
 }
 
 /**
- * 包一层 PDF 提取 + 解析调用，方便 T1（PdfText）/T2（ScheduleParser）落地后只改这一处。
+ * PDF 提取与解析入口。
  *
  * 提取与解析都在 core 模块，纯 JVM 无 Android 依赖，已由 ScheduleParserSmokeTest 端到端验证。
  */
-private fun parsePdf(bytes: ByteArray): ParseResult {
-    val spans = com.qingke.schedule.pdf.PdfText.extract(bytes)
-    return com.qingke.schedule.parse.ScheduleParser.parse(spans)
+private fun parsePdf(context: android.content.Context, bytes: ByteArray): ParseResult {
+    val extracted = com.qingke.schedule.pdf.PdfText.extract(bytes)
+    val spans = try { com.qingke.schedule.pdf.PdfGlyphRecovery.recover(context, bytes, extracted) }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { return com.qingke.schedule.parse.ScheduleParser.parse(extracted).let {
+            it.copy(warnings = listOf("离线图像识别未完成，已使用文字层结果，请核对乱码位置") + it.warnings)
+        } }
+    val result = com.qingke.schedule.parse.ScheduleParser.parse(spans)
+    val repaired = extracted.zip(spans).count { (before, after) -> before.text != after.text }
+    return if (repaired > 0) result.copy(warnings = listOf("已通过离线图像识别恢复 $repaired 处字符，请核对识别结果") + result.warnings) else result
 }
 
 /** 1=周一 … 7=周日。 */
@@ -125,7 +134,7 @@ private fun periodLabel(start: Int, end: Int): String =
 private fun parseWeekNumber(text: String): Int =
     text.toIntOrNull()?.coerceIn(1, 52) ?: 1
 
-/** T6 实现：选 PDF -> 解析预览 -> 设开学日期 -> 确认导入。 */
+/** 选 PDF / JSON -> 解析预览 -> 设开学日期 -> 确认导入。 */
 @Composable
 fun ImportScreen(onBack: () -> Unit) {
     val appState = LocalAppState.current
@@ -135,6 +144,7 @@ fun ImportScreen(onBack: () -> Unit) {
     var step by remember { mutableStateOf<ImportStep>(ImportStep.Pick) }
     var pickedUri by remember { mutableStateOf<Uri?>(null) }
     var parseJobId by remember { mutableStateOf(0) }
+    var importedArchive by remember { mutableStateOf<ScheduleArchive?>(null) }
     var pickError by remember { mutableStateOf<String?>(null) }
 
     // 开学日期设置（步骤 3 用），默认方式①「今天是第几周」。
@@ -153,6 +163,7 @@ fun ImportScreen(onBack: () -> Unit) {
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             pickError = null
+            importedArchive = null
             pickedUri = uri
             parseJobId += 1
             step = ImportStep.Parsing
@@ -180,14 +191,36 @@ fun ImportScreen(onBack: () -> Unit) {
                 // 文件大小可查且超过 20 MB，直接拦掉。
                 if (fileSize != null && fileSize > 20 * 1024 * 1024) {
                     val sizeMB = fileSize / (1024 * 1024)
-                    throw PdfUnsupportedException("文件过大（$sizeMB MB），请确认选择的是课表 PDF")
+                    throw PdfUnsupportedException("文件过大（$sizeMB MB），请确认选择的是课表文件")
                 }
 
-                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
+                    val output = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(8192)
+                    while (output.size() <= ScheduleTransfer.MAX_FILE_BYTES) {
+                        val count = input.read(buffer, 0, minOf(buffer.size, ScheduleTransfer.MAX_FILE_BYTES + 1 - output.size()))
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                    }
+                    output.toByteArray()
+                }
                     ?: throw PdfUnsupportedException("无法打开所选文件，请确认文件是否仍然存在")
-                parsePdf(bytes)
+                require(bytes.size <= ScheduleTransfer.MAX_FILE_BYTES) { "文件超过 20 MB，请选择较小的课表文件" }
+                if (bytes.copyOfRange(0, minOf(5, bytes.size)).toString(Charsets.US_ASCII) == "%PDF-") {
+                    parsePdf(context, bytes) to null
+                } else {
+                    val archive = ScheduleTransfer.decode(bytes.toString(Charsets.UTF_8))
+                    val data = archive.schedule
+                    ParseResult(data.semester.title, data.courses, data.flexCourses, data.semester.totalWeeks,
+                        listOf(if (archive.periodTimes != null) "将同步导入文件中的上课时间" else "文件不含上课时间，将保留本机设置")) to archive
+                }
             }
-            step = ImportStep.Preview(result)
+            importedArchive = result.second
+            result.second?.let {
+                dateMethod = 2
+                pickedRawDate = LocalDate.parse(it.schedule.semester.startMonday)
+            }
+            step = ImportStep.Preview(result.first)
         } catch (e: CancellationException) {
             throw e // 页面被提前关闭导致协程取消，属于正常退出，不当作解析失败处理
         } catch (e: Throwable) {
@@ -221,7 +254,7 @@ fun ImportScreen(onBack: () -> Unit) {
                     pickError = pickError,
                     onPick = {
                         try {
-                            launcher.launch(arrayOf("application/pdf"))
+                            launcher.launch(arrayOf("application/pdf", "application/json", "text/json", "text/plain", "application/octet-stream"))
                         } catch (e: ActivityNotFoundException) {
                             pickError = "未找到可用的文件选择器，请安装一个文件管理器后重试"
                         }
@@ -256,7 +289,13 @@ fun ImportScreen(onBack: () -> Unit) {
                     hasExisting = appState.hasSchedule,
                     onPrev = { step = ImportStep.Preview(currentStep.result) },
                     onConfirm = {
-                        appState.importResult(currentStep.result, computedMonday)
+                        val archive = importedArchive
+                        if (archive != null) {
+                            appState.replaceSchedule(archive.schedule.copy(semester = archive.schedule.semester.copy(startMonday = computedMonday.toString())))
+                            archive.periodTimes?.let { times -> appState.updateSettings { it.copy(periodTimes = times) } }
+                        } else {
+                            appState.importResult(currentStep.result, computedMonday)
+                        }
                         onBack()
                     },
                 )
@@ -308,14 +347,14 @@ private fun PickContent(pickError: String?, onPick: () -> Unit) {
         verticalArrangement = Arrangement.Center,
     ) {
         Text(
-            "从教务系统下载课表 PDF 后，在这里选择文件",
+            "选择教务系统的 PDF，或同学分享的 JSON 课表文件",
             style = MaterialTheme.typography.bodyLarge,
             textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.height(24.dp))
         Button(onClick = onPick, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-            Text("选择 PDF 文件", style = MaterialTheme.typography.titleMedium)
+            Text("选择课表文件", style = MaterialTheme.typography.titleMedium)
         }
         if (pickError != null) {
             Spacer(Modifier.height(12.dp))
@@ -333,7 +372,7 @@ private fun ParsingContent() {
     ) {
         CircularProgressIndicator()
         Spacer(Modifier.height(16.dp))
-        Text("正在解析 PDF…", style = MaterialTheme.typography.bodyMedium)
+        Text("正在读取课表…", style = MaterialTheme.typography.bodyMedium)
     }
 }
 
@@ -350,7 +389,7 @@ private fun FailedContent(reason: String, rawText: String, onRetry: () -> Unit) 
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error)
-        Text("无法识别这份 PDF", style = MaterialTheme.typography.titleMedium)
+        Text("无法读取这份课表", style = MaterialTheme.typography.titleMedium)
         Text(reason, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (rawText.isNotBlank()) {
             Text("已提取到的原始文字（反馈问题时可以复制发给开发者）", style = MaterialTheme.typography.labelLarge)
@@ -391,7 +430,7 @@ private fun PreviewContent(
     val practiceCount = result.flexCourses.count { it.kind == "实践" }
     val otherCount = result.flexCourses.size - practiceCount
     val summary = buildString {
-        append("识别到 ${result.courses.size} 门课、$practiceCount 门实践课")
+        append("识别到 ${result.courses.size} 条上课安排、$practiceCount 门实践课")
         if (otherCount > 0) append("、$otherCount 门其他课程")
     }
 
@@ -605,7 +644,7 @@ private fun ConfirmContent(
         ) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("学期：${result.semesterTitle ?: "我的课表"}")
-                Text("课程：${result.courses.size} 门课、$practiceCount 门实践课")
+                Text("安排：${result.courses.size} 条、$practiceCount 门实践课")
                 Text("开学日：$computedMonday（周一）")
             }
         }

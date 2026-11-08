@@ -148,7 +148,7 @@ private fun EmptyScheduleState(onOpenDrawer: () -> Unit) {
         )
         Spacer(Modifier.height(10.dp))
         Text(
-            text = "去设置里导入 PDF，马上就能看到课表",
+            text = "去设置里导入课表，也可以手动添加课程",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,

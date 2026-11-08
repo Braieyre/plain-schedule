@@ -7,25 +7,9 @@ import com.qingke.schedule.model.PdfUnsupportedException
 import com.qingke.schedule.model.Span
 import kotlin.math.abs
 
-/**
- * 把 [Span] 列表(PDF 内容流抽出的文字碎片,坐标已归一)解析成结构化课表。
- *
- * 不依赖任何"几何切格子"的判断,只靠"锚点定位 + 拼接 + 正则切分":
- * 1. 用七个"星期X"表头 span 定位七列锚点;轴向自适应——比较七锚点在 x/y 上的方差,
- *    方差大的那个是"日期轴",另一个是"行轴"。这样无论内容流坐标是否被 /Rotate 影响都成立。
- * 2. 列带宽取相邻锚点间距中位数,其余 span 按日期轴坐标落入对应列带;
- *    行轴坐标不早于表头那一行的(即页眉/页脚/大标题)一律不参与分列,
- *    这一步顺带把表头"星期X"自身、页面大标题(可能水平方向恰好落在某个列带内)都排除掉了。
- * 3. 列内 span 按行轴坐标降序排序后**首尾直接拼接**成一个大字符串,不插入任何分隔符——
- *    课名/详情跨行折断由此天然被"拼接"消解,不需要单独处理换行。
- * 4. 用 "(N-M节)" 正则在拼接串里找课程锚点做正向单遍扫描:每个锚点之后依次按
- *    "/场地:" "/教师:" "/考核方式:" 三个标签切出周次串/教室/教师;"考核方式"取值固定
- *    两个汉字(考试/考查等)而不是"取到下一个锚点前的全部文本"——因为它后面没有分隔符,
- *    不这样精确定界就会把下一门课的课名吞进当前课程的考核方式里。
- */
+/** 按页归一文字和星期表头，在原有标签格式与通用网格格式之间选择并合并去重。 */
 object ScheduleParser {
 
-    private val WEEKDAYS = listOf("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
     private val SEMESTER_REGEX = Regex("""\d{4}-\d{4}学年第?\d学期""")
     private val PERIOD_ANCHOR_REGEX = Regex("""\((\d+)(?:-(\d+))?节\)""")
     private val MARKERS = charArrayOf('★', '●', '▲', '■')
@@ -37,6 +21,48 @@ object ScheduleParser {
     private val COMMA_SPLIT_REGEX = Regex("[,，]")
 
     fun parse(spans: List<Span>): ParseResult {
+        MultiCourseTableParser.parse(spans)?.let { return it }
+        val pages = spans.groupBy { it.page }.toSortedMap()
+        val results = mutableListOf<ParseResult>()
+        val warnings = mutableListOf<String>()
+        for ((page, original) in pages) {
+            val normalized = original.map { it.copy(text = normalizeText(it.text)) }
+            val combined = normalized.joinToString("") { it.text }
+            val legacy = if (listOf("/场地", "/教师", "/考核方式").all { it in combined }) {
+                runCatching { parseLegacy(normalized) }.getOrNull()
+            } else null
+            val generic = GridScheduleParser.parse(normalized)
+            val result = if (legacy != null && legacy.courses.size >= generic.courses.size) legacy
+                else generic.copy(flexCourses = legacy?.flexCourses.orEmpty())
+            if (result.courses.isNotEmpty() || result.flexCourses.isNotEmpty()) results += result
+            else warnings += "第 $page 页未识别到课程，请核对是否有遗漏"
+        }
+        val courses = results.flatMap { it.courses }
+            .distinctBy { listOf(it.day, it.startPeriod, it.endPeriod, it.name, it.weeks, it.room, it.teachers, it.exam) }
+            .mapIndexed { index, course -> course.copy(id = "import-$index") }
+        val flex = results.flatMap { it.flexCourses }.distinctBy { listOf(it.name, it.weeks, it.teachers, it.room, it.kind) }
+            .mapIndexed { index, course -> course.copy(id = "flex-import-$index") }
+        if (courses.isEmpty() && flex.isEmpty()) throw PdfUnsupportedException(
+            "已读到文字，但尚未识别出课程。请确认 PDF 含星期表头、节次和周次；也可请同学分享 JSON 课表。",
+            spans.joinToString("\n") { it.text },
+        )
+        return ParseResult(results.firstNotNullOfOrNull { it.semesterTitle }, courses, flex,
+            (courses.flatMap { it.weeks } + flex.flatMap { it.weeks }).maxOrNull() ?: 1,
+            (results.flatMap { it.warnings } + warnings).distinct())
+    }
+
+    internal fun normalizeText(text: String): String = java.text.Normalizer.normalize(text, java.text.Normalizer.Form.NFKC)
+        .replace('～', '-').replace('~', '-').replace('—', '-').replace('–', '-').replace('−', '-')
+        .replace(Regex("""星\s*期\s*([一二三四五六日天])""")) { "星期${it.groupValues[1]}" }
+        .replace("星期天", "星期日").replace("周天", "周日")
+        .replace(Regex("""^(?:星期|周)\s*([一二三四五六日])$""")) { "星期${it.groupValues[1]}" }
+
+    internal fun weekday(text: String): Int? {
+        val match = Regex("""^(?:星期|周)([一二三四五六日天])(?:\s.*)?$""").matchEntire(text.trim()) ?: return null
+        return "一二三四五六日天".indexOf(match.groupValues[1]).let { if (it == 7) 7 else it + 1 }
+    }
+
+    private fun parseLegacy(spans: List<Span>): ParseResult {
         if (spans.isEmpty()) {
             throw PdfUnsupportedException("无法识别这份课表 PDF", rawText = "")
         }
@@ -48,24 +74,22 @@ object ScheduleParser {
             .mapNotNull { SEMESTER_REGEX.find(it.text)?.value }
             .firstOrNull()
 
-        // ---- 定位七个"星期X"锚点 ----
+        // ---- 定位可用的星期表头 ----
         val anchorIndex = HashMap<Int, Int>() // day(1..7) -> spans 下标,重复出现取第一个
         for (i in spans.indices) {
-            val day = WEEKDAYS.indexOf(spans[i].text) + 1
+            val day = weekday(spans[i].text) ?: 0
             if (day in 1..7 && day !in anchorIndex) anchorIndex[day] = i
         }
 
         val assigned = BooleanArray(spans.size)
         val courses = mutableListOf<Course>()
 
-        // 轴向默认取原始 (x,y);七个锚点齐全时按方差重新判定,并用于列带切分。
-        // 锚点不全(七个"星期X"没找齐)就跳过固定节次课程解析,但仍尝试页脚 flex 课程——
-        // 尽量部分可用而不是直接整体报错。
+        // 至少两个星期表头即可确定日期轴和列宽，允许不含周末的工作日课表。
         var dateAxis: (Span) -> Float = Span::x
         var rowAxis: (Span) -> Float = Span::y
 
-        if (anchorIndex.size == 7) {
-            val anchors = (1..7).map { spans[anchorIndex.getValue(it)] }
+        if (anchorIndex.size >= 2) {
+            val anchors = anchorIndex.values.map { spans[it] }
             val dateIsX = variance(anchors.map { it.x }) >= variance(anchors.map { it.y })
             dateAxis = if (dateIsX) Span::x else Span::y
             rowAxis = if (dateIsX) Span::y else Span::x
@@ -73,7 +97,7 @@ object ScheduleParser {
             for (idx in anchorIndex.values) assigned[idx] = true
 
             val headerRowAxis = anchors.map { rowAxis(it) }.average().toFloat()
-            val anchorDate = (1..7).associateWith { day -> dateAxis(spans[anchorIndex.getValue(day)]) }
+            val anchorDate = anchorIndex.mapValues { (_, index) -> dateAxis(spans[index]) }
             val sortedVals = anchorDate.values.sorted()
             val bandWidth = median(sortedVals.zipWithNext { a, b -> b - a })
             val half = bandWidth / 2f
@@ -85,7 +109,7 @@ object ScheduleParser {
                 // 行轴不早于表头那一行的,是页面大标题/页眉/页脚一类的内容,不进入任何列带。
                 if (rowAxis(s) >= headerRowAxis) continue
                 val da = dateAxis(s)
-                for (day in 1..7) {
+                for (day in anchorIndex.keys) {
                     val center = anchorDate.getValue(day)
                     if (da >= center - half && da < center + half) {
                         buckets.getValue(day).add(i)
@@ -101,7 +125,7 @@ object ScheduleParser {
                 courses += parseColumn(day, text, warnings)
             }
         } else {
-            warnings += "未能定位到完整的七个星期表头(星期一~星期日),固定节次课程解析已跳过"
+            warnings += "未能定位到足够的星期表头，固定节次课程解析已跳过"
         }
 
         // ---- 页脚 flex 课程:实践课程 / 其他课程,从"所有列带之外"的 span 里找 ----
@@ -192,6 +216,10 @@ object ScheduleParser {
                 if (teacherLabel != null) warnings += "$ctx 缺少「/考核方式:」标签"
             }
 
+            if (startPeriod !in 1..12 || endPeriod !in startPeriod..12) {
+                warnings += "$ctx 节次超出支持范围，已跳过"
+                continue
+            }
             if (name.isEmpty()) {
                 warnings += "$ctx 课程名称为空,已跳过该条目"
                 continue
@@ -200,6 +228,10 @@ object ScheduleParser {
             val weeks = parseWeeks(weeksRaw, ctx, warnings)
             val teachers = splitTeachers(teachersRaw)
 
+            if (weeks.isEmpty()) {
+                warnings += "$ctx 缺少有效周次，已跳过"
+                continue
+            }
             result += Course(
                 id = "${day}-${startPeriod}-${name}",
                 name = name,
@@ -354,7 +386,7 @@ object ScheduleParser {
             }
             val start = m.groupValues[1].toInt()
             val end = m.groupValues[2].ifEmpty { m.groupValues[1] }.toInt()
-            if (start > end) {
+            if (start !in 1..52 || end !in start..52) {
                 warnings += "$ctx 周次范围颠倒「$seg」"
                 continue
             }

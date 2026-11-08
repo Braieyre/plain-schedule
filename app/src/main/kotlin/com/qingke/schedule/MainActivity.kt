@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 /** 导航目的地。刻意用一个 sealed interface 代替 navigation 库，省一个依赖。 */
 sealed interface Screen {
     data object Schedule : Screen
+    data object Export : Screen
     data object Import : Screen
     data object PeriodTimes : Screen
     data object Appearance : Screen
@@ -77,6 +78,7 @@ private fun AppRoot() {
                 onAddCourse = { screen = Screen.Edit(null) },
                 onEditCourse = { screen = Screen.Edit(it) },
             )
+            Screen.Export -> ExportScreen(onBack = { screen = Screen.Schedule })
             Screen.Import -> ImportScreen(onBack = { screen = Screen.Schedule })
             Screen.PeriodTimes -> PeriodTimesScreen(onBack = { screen = Screen.Schedule })
             Screen.Appearance -> AppearanceScreen(onBack = { screen = Screen.Schedule })

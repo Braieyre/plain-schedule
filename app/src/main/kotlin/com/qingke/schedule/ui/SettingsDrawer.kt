@@ -93,8 +93,12 @@ fun SettingsDrawer(onNavigate: (Screen) -> Unit, onClose: () -> Unit) {
                 )
 
                 DrawerItem(
-                    title = "导入 PDF 课表",
+                    title = "导入课表",
                     onClick = { onNavigate(Screen.Import) },
+                )
+                DrawerItem(
+                    title = "导出课表",
+                    onClick = if (hasSchedule) ({ onNavigate(Screen.Export) }) else null,
                 )
                 DrawerItem(
                     title = "上课时间",

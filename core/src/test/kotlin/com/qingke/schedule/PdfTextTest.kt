@@ -218,6 +218,63 @@ class PdfTextTest {
         assertEquals("加密", spans.single().text)
     }
 
+    @Test
+    fun `字体宽度和缩放可用于还原英文词间空格`() {
+        val pdf = buildMinimalPdf(fontObjBody = "<</Type/Font/Subtype/Type1/FirstChar 65/Widths [600 500]>>",
+            content = "0.5 0 0 0.5 0 0 cm BT /F1 10 Tf 1 0 0 1 20 40 Tm (AB) Tj ET")
+        assertEquals(5.5f, PdfText.extract(pdf).single().width, 0.01f)
+    }
+
+    @Test
+    fun `矩形裁剪区域随qQ正确保存和恢复`() {
+        val pdf = buildMinimalPdf(fontObjBody = "<</Type/Font/Subtype/Type1>>",
+            content = "10 20 100 60 re W n q 20 30 40 20 re W* n BT /F1 10 Tf (A) Tj ET Q BT /F1 10 Tf (B) Tj ET")
+        val spans = PdfText.extract(pdf)
+        assertEquals(com.qingke.schedule.model.SpanBounds(20f, 30f, 60f, 50f), spans[0].clip)
+        assertEquals(com.qingke.schedule.model.SpanBounds(10f, 20f, 110f, 80f), spans[1].clip)
+    }
+
+    @Test
+    fun `TJ数组中的多个字符串不会丢失`() {
+        val pdf = buildMinimalPdf(fontObjBody = "<</Type/Font/Subtype/Type0/Encoding/UniGB-UCS2-H>>",
+            content = "BT /F1 10 Tf 1 0 0 1 20 40 Tm [<4F60> -20 <597D>] TJ ET")
+        assertEquals("你好", PdfText.extract(pdf).single().text)
+    }
+
+    @Test
+    fun `IdentityH优先使用ToUnicode而不是把字形编号当汉字`() {
+        val cmap = "1 begincodespacerange <0000> <ffff> endcodespacerange 2 beginbfchar <0001> <8BFE> <0002> <8868> endbfchar"
+        val pdf = buildMinimalPdf(fontObjBody = "<</Type/Font/Subtype/Type0/Encoding/Identity-H/ToUnicode 6 0 R>>",
+            extraObjects = mapOf(6 to "<</Length ${cmap.length}>>\nstream\n$cmap\nendstream"),
+            content = "BT /F1 10 Tf 1 0 0 1 20 40 Tm <00010002> Tj ET")
+        assertEquals("课表", PdfText.extract(pdf).single().text)
+    }
+
+    @Test
+    fun `字体字典间接引用可以读取`() {
+        val pdf = buildMinimalPdf(fontObjBody = "<</Type/Font/Subtype/Type0/Encoding/UniGB-UCS2-H>>",
+            extraObjects = mapOf(7 to "<</F1 4 0 R>>"), content = "BT /F1 10 Tf <4F60597D> Tj ET")
+            .toString(Charsets.ISO_8859_1).replace("/Font<</F1 4 0 R>>", "/Font 7 0 R").toByteArray(Charsets.ISO_8859_1)
+        assertEquals("你好", PdfText.extract(pdf).single().text)
+    }
+
+    @Test
+    fun `页面和字体压入对象流仍可读取`() {
+        val page = "<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>"
+        val font = "<</Type/Font/Subtype/Type0/Encoding/UniGB-UCS2-H>>"
+        val header = "3 0 4 ${page.length + 1} "
+        val packed = header + page + " " + font
+        val output = java.io.ByteArrayOutputStream()
+        java.util.zip.DeflaterOutputStream(output).use { it.write(packed.toByteArray(Charsets.ISO_8859_1)) }
+        val compressed = output.toByteArray().toString(Charsets.ISO_8859_1)
+        val content = "BT /F1 10 Tf 1 0 0 1 20 40 Tm <4F60597D> Tj ET"
+        val pdf = ("%PDF-1.5\n1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n" +
+            "2 0 obj <</Type/Pages/Count 1/Kids[3 0 R]>> endobj\n" +
+            "5 0 obj <</Length ${content.length}>>\nstream\n$content\nendstream\nendobj\n" +
+            "6 0 obj <</Type/ObjStm/N 2/First ${header.length}/Length ${output.size()}/Filter/FlateDecode>>\nstream\n$compressed\nendstream\nendobj").toByteArray(Charsets.ISO_8859_1)
+        assertEquals("你好", PdfText.extract(pdf).single().text)
+    }
+
     /**
      * 拼一份最小可用的合成 PDF：固定 Catalog(1)/Pages(2)/Page(3)/Contents(5) 骨架，
      * 调用方提供 4 号字体对象体、可选附加对象（如 6 号 ToUnicode 流）与内容流正文。

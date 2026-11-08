@@ -2,6 +2,7 @@ package com.qingke.schedule.pdf
 
 import com.qingke.schedule.model.PdfUnsupportedException
 import com.qingke.schedule.model.Span
+import com.qingke.schedule.model.SpanBounds
 import java.io.ByteArrayOutputStream
 import java.util.zip.Inflater
 
@@ -15,20 +16,26 @@ import java.util.zip.Inflater
  * 已知的刻意简化（样本不需要，其它教务系统 PDF 若命中会退化但不会崩）：
  * - 不做基于字形宽度的 Tj 后光标推进（样本每个折行都有独立 Tm，用不到）；
  * - TJ 数组里的多个串按顺序拼接成一个 span 输出，字距数字整体忽略；
- * - 不支持内联图像 `BI...ID...EI`、对象流 `/Type/ObjStm`、加密文档。
+ * - 不支持图片 OCR、内联图像 `BI...ID...EI`、加密文档。
  */
 object PdfText {
 
     /** 抽取全部文字及视图坐标（已按 CTM 与页面 /Rotate 归一）。无法解析时抛 [PdfUnsupportedException]。 */
     fun extract(bytes: ByteArray): List<Span> {
         val collected = ArrayList<Span>()
+        val failedPages = mutableListOf<Int>()
         try {
             val doc = String(bytes, Charsets.ISO_8859_1)
 
             // 检测加密：在解析对象之前先检查 trailer 中是否有 /Encrypt 字典
             checkEncryption(doc)
 
+            require(bytes.size <= 20 * 1024 * 1024) { "PDF 超过 20 MB" }
             val objects = scanObjects(doc)
+            expandObjectStreams(objects)
+            if (objects.values.any { body ->
+                Regex("""/Type\s*/XRef\b""").containsMatchIn(body) && keyRegex("Encrypt").containsMatchIn(body.substringBefore("stream"))
+            }) throw PdfUnsupportedException("这份 PDF 已加密，请先移除密码保护后重试")
             if (objects.isEmpty()) {
                 throw PdfUnsupportedException("未找到任何 PDF 对象，可能不是有效的 PDF 文件")
             }
@@ -39,9 +46,10 @@ object PdfText {
             for ((idx, pageNum) in pageObjNums.withIndex()) {
                 try {
                     collected += extractPageSpans(objects, pageNum, idx + 1)
+                } catch (e: PdfUnsupportedException) {
+                    throw e
                 } catch (e: Exception) {
-                    // 单页解析失败不影响其它页：继续处理剩余页面，最终是否算「解析失败」
-                    // 由下面 collected 是否为空统一判定。
+                    failedPages += idx + 1
                 }
             }
         } catch (e: PdfUnsupportedException) {
@@ -50,8 +58,9 @@ object PdfText {
             val raw = collected.joinToString("\n") { it.text }
             throw PdfUnsupportedException("PDF 解析异常：${e.message}", raw)
         }
+        if (failedPages.isNotEmpty()) throw PdfUnsupportedException("PDF 第 ${failedPages.joinToString()} 页读取失败，请重新导出文件", collected.joinToString("\n") { it.text })
         if (collected.isEmpty()) {
-            throw PdfUnsupportedException("未能从 PDF 中提取到任何文字")
+            throw PdfUnsupportedException("未能从 PDF 中提取到文字。这可能是扫描件、图片课表或暂不支持的编码，请使用教务系统直接导出的文字型 PDF，或导入同学分享的 JSON 课表")
         }
         return collected
     }
@@ -72,6 +81,28 @@ private fun scanObjects(doc: String): LinkedHashMap<Int, String> {
         map[num] = m.groupValues[2]
     }
     return map
+}
+
+/** PDF 1.5 常将页面和字体字典压入 ObjStm；内容流本身仍由普通 stream 保存。 */
+private fun expandObjectStreams(objects: LinkedHashMap<Int, String>) {
+    for (body in objects.values.toList()) {
+        if (!Regex("""/Type\s*/ObjStm\b""").containsMatchIn(body.substringBefore("stream"))) continue
+        val count = findIntValue(body, "N") ?: continue
+        val first = findIntValue(body, "First") ?: continue
+        if (count !in 1..100000) continue
+        val bytes = extractStreamBytes(body, objects) ?: continue
+        if (first !in 0..bytes.size) continue
+        val header = String(bytes, 0, first, Charsets.ISO_8859_1).trim().split(Regex("""\s+"""))
+            .mapNotNull { it.toIntOrNull() }
+        if (header.size != count * 2) continue
+        for (i in 0 until count) {
+            val number = header[i * 2]
+            val offset = header[i * 2 + 1]
+            val next = if (i + 1 < count) header[(i + 1) * 2 + 1] else bytes.size - first
+            if (offset < 0 || next < offset || next > bytes.size - first) continue
+            objects.putIfAbsent(number, String(bytes, first + offset, next - offset, Charsets.ISO_8859_1))
+        }
+    }
 }
 
 private val CATALOG_TYPE_RE = Regex("""/Type\s*/Catalog(?![A-Za-z])""")
@@ -238,19 +269,23 @@ private fun resolveLengthValue(dictPart: String, objects: Map<Int, String>): Int
 
 private fun inflate(data: ByteArray): ByteArray {
     val inflater = Inflater()
-    inflater.setInput(data)
-    val out = ByteArrayOutputStream(maxOf(data.size * 3, 256))
-    val buf = ByteArray(8192)
-    while (!inflater.finished()) {
-        val n = inflater.inflate(buf)
-        if (n == 0) {
-            if (inflater.needsInput() || inflater.needsDictionary()) break
-        } else {
+    try {
+        inflater.setInput(data)
+        val out = ByteArrayOutputStream(minOf(maxOf(data.size, 256), 65536))
+        val buf = ByteArray(8192)
+        while (!inflater.finished()) {
+            val n = inflater.inflate(buf)
+            if (n == 0) {
+                if (inflater.finished()) break
+                throw PdfUnsupportedException("PDF 压缩数据不完整或无法读取")
+            }
+            if (out.size() + n > 32 * 1024 * 1024) throw PdfUnsupportedException("PDF 解压后过大，请使用较小的课表文件")
             out.write(buf, 0, n)
         }
+        return out.toByteArray()
+    } finally {
+        inflater.end()
     }
-    inflater.end()
-    return out.toByteArray()
 }
 
 // ============================================================
@@ -261,26 +296,36 @@ private fun inflate(data: ByteArray): ByteArray {
 
 private enum class DecodeMode { UTF16BE, TO_UNICODE, LATIN1 }
 
-private class FontInfo(val mode: DecodeMode, val toUnicode: Map<Int, String> = emptyMap(), val codeBytes: Int = 2)
+private data class FontInfo(
+    val mode: DecodeMode,
+    val toUnicode: Map<Int, String> = emptyMap(),
+    val codeBytes: Int = 2,
+    val widths: Map<Int, Double> = emptyMap(),
+    val sourceId: Int = 0,
+)
 
 /** 解析页面 /Resources 里的 /Font 子字典，建立资源名（如 "F1"）-> FontInfo 映射。 */
 private fun buildFontMap(objects: Map<Int, String>, resourcesText: String): Map<String, FontInfo> {
-    val fontDictText = findSubDict(resourcesText, "Font") ?: return emptyMap()
+    val fontDictText = findRef(resourcesText, "Font")?.let { objects[it] }
+        ?: findSubDict(resourcesText, "Font") ?: return emptyMap()
     val result = HashMap<String, FontInfo>()
     for (m in Regex("""/(\S+?)\s+(\d+)\s+\d+\s+R""").findAll(fontDictText)) {
         val resName = m.groupValues[1]
         val objNum = m.groupValues[2].toIntOrNull() ?: continue
         val fontBody = objects[objNum] ?: continue
-        result[resName] = resolveFontInfo(objects, fontBody)
+        val info = resolveFontInfo(objects, fontBody)
+        val widthsBody = findRef(fontBody, "Widths")?.let { objects[it] }
+            ?: Regex("""/Widths\s*(\[[^]]*])""").find(fontBody)?.groupValues?.get(1)
+        val firstChar = findIntValue(fontBody, "FirstChar") ?: 0
+        val widths = widthsBody?.let { Regex("""[-+]?\d+(?:\.\d+)?""").findAll(it).take(65536)
+            .mapIndexed { index, value -> (firstChar + index) to value.value.toDouble() }.toMap() }.orEmpty()
+        result[resName] = info.copy(widths = widths, sourceId = objNum)
     }
     return result
 }
 
 private fun resolveFontInfo(objects: Map<Int, String>, fontBody: String): FontInfo {
     val encodingName = findNameValue(fontBody, "Encoding")
-    if (encodingName != null && (encodingName.contains("UCS2") || encodingName.contains("Identity"))) {
-        return FontInfo(DecodeMode.UTF16BE)
-    }
     val toUnicodeRef = findRef(fontBody, "ToUnicode")
     if (toUnicodeRef != null) {
         val streamBody = objects[toUnicodeRef]
@@ -292,6 +337,11 @@ private fun resolveFontInfo(objects: Map<Int, String>, fontBody: String): FontIn
                 return FontInfo(DecodeMode.TO_UNICODE, map, detectCodeBytes(cmapText))
             }
         }
+    }
+    // Identity-H 是字形编号，不等于 Unicode；必须优先使用 ToUnicode。
+    if (encodingName?.contains("UCS2") == true) return FontInfo(DecodeMode.UTF16BE)
+    if (encodingName?.contains("Identity") == true) {
+        throw PdfUnsupportedException("PDF 的嵌入字体缺少 Unicode 映射，请换用教务系统直接导出的文字型 PDF")
     }
     return FontInfo(DecodeMode.LATIN1)
 }
@@ -318,6 +368,9 @@ private fun parseToUnicodeCMap(cmapText: String): Map<Int, String> {
             val lo = m.groupValues[1].toIntOrNull(16) ?: continue
             val hi = m.groupValues[2].toIntOrNull(16) ?: continue
             val dst = m.groupValues[3]
+            if (lo < 0 || hi < lo || hi.toLong() - lo > 65535 || map.size > 100000) {
+                throw PdfUnsupportedException("PDF 字体映射范围过大或无效，请重新导出课表")
+            }
             if (dst.startsWith("[")) {
                 val items = Regex("""<([0-9A-Fa-f]+)>""").findAll(dst).map { it.groupValues[1] }.toList()
                 for ((offset, code) in (lo..hi).withIndex()) {
@@ -564,7 +617,7 @@ private class Mat(val a: Double, val b: Double, val c: Double, val d: Double, va
 }
 
 /** q/Q 保存与恢复的图形状态：CTM + 文本状态里同样属于图形状态的字体/字号/行距。 */
-private class GState(val ctm: Mat, val fontName: String, val fontSize: Double, val leading: Double)
+private class GState(val ctm: Mat, val fontName: String, val fontSize: Double, val leading: Double, val clip: SpanBounds?)
 
 private fun interpretPage(
     tokens: List<Tok>,
@@ -575,6 +628,8 @@ private fun interpretPage(
 ): List<Span> {
     val spans = ArrayList<Span>()
     var ctm = Mat.IDENTITY
+    var clip: SpanBounds? = null
+    var pathRect: SpanBounds? = null
     val gStack = ArrayDeque<GState>()
     var fontName = ""
     var fontSize = 0.0
@@ -594,7 +649,22 @@ private fun interpretPage(
             // 每个串的位置 = 文本矩阵 × CTM 的平移分量。
             val combined = textMatrix.then(ctm)
             val (nx, ny) = normalizePoint(combined.e, combined.f, rotate, mediaBox)
-            spans += Span(page = pageNumber, x = nx.toFloat(), y = ny.toFloat(), size = fontSize.toFloat(), text = text)
+            val info = fonts[fontName]
+            val codeWidth = when (info?.mode) {
+                DecodeMode.UTF16BE -> 2
+                DecodeMode.TO_UNICODE -> info.codeBytes
+                else -> 1
+            }.coerceIn(1, 4)
+            var units = 0.0
+            for (offset in bytes.indices step codeWidth) {
+                var code = 0
+                for (k in offset until minOf(offset + codeWidth, bytes.size)) code = (code shl 8) or (bytes[k].toInt() and 255)
+                units += info?.widths?.get(code) ?: if (codeWidth == 2) 1000.0 else 500.0
+            }
+            val advance = units / 1000 * fontSize
+            val (ex, ey) = normalizePoint(combined.e + combined.a * advance, combined.f + combined.b * advance, rotate, mediaBox)
+            val width = kotlin.math.hypot(ex - nx, ey - ny).toFloat()
+            spans += Span(page = pageNumber, x = nx.toFloat(), y = ny.toFloat(), size = fontSize.toFloat(), text = text, width = width, clip = clip, glyphKey = "${info?.sourceId}:${bytes.joinToString("") { "%02x".format(it.toInt() and 255) }}")
         }
     }
 
@@ -625,18 +695,34 @@ private fun interpretPage(
             is Tok.Num -> { operands += t.v; i++ }
             is Tok.Name -> { operands += t.v; i++ }
             is Tok.Str -> { operands += t.v; i++ }
-            is Tok.ArrStart -> { val (arr, next) = readArray(i + 1); operands.addAll(arr); i = next }
+            is Tok.ArrStart -> { val (arr, next) = readArray(i + 1); operands.add(arr); i = next }
             is Tok.ArrEnd -> i++ // 不应单独出现，容错跳过
             is Tok.Op -> {
                 when (t.v) {
-                    "q" -> gStack.addLast(GState(ctm, fontName, fontSize, leading))
+                    "q" -> gStack.addLast(GState(ctm, fontName, fontSize, leading, clip))
                     "Q" -> if (gStack.isNotEmpty()) {
                         val g = gStack.removeLast()
-                        ctm = g.ctm; fontName = g.fontName; fontSize = g.fontSize; leading = g.leading
+                        ctm = g.ctm; fontName = g.fontName; fontSize = g.fontSize; leading = g.leading; clip = g.clip
+                        pathRect = null
                     }
                     "cm" -> if (operands.size >= 6) {
                         ctm = mat6(operands.size - 6).then(ctm)
                     }
+                    "re" -> if (operands.size >= 4) {
+                        val nums = operands.takeLast(4).map { it as? Double ?: 0.0 }
+                        val corners = listOf(nums[0] to nums[1], nums[0] + nums[2] to nums[1],
+                            nums[0] to nums[1] + nums[3], nums[0] + nums[2] to nums[1] + nums[3]).map { (x, y) ->
+                            normalizePoint(x * ctm.a + y * ctm.c + ctm.e, x * ctm.b + y * ctm.d + ctm.f, rotate, mediaBox)
+                        }
+                        pathRect = SpanBounds(corners.minOf { it.first }.toFloat(), corners.minOf { it.second }.toFloat(),
+                            corners.maxOf { it.first }.toFloat(), corners.maxOf { it.second }.toFloat())
+                    }
+                    "W", "W*" -> pathRect?.let { rect ->
+                        val old = clip
+                        clip = if (old == null) rect else SpanBounds(maxOf(old.left, rect.left), maxOf(old.bottom, rect.bottom),
+                            minOf(old.right, rect.right), minOf(old.top, rect.top))
+                    }
+                    "n", "f", "f*", "S", "s", "m", "l", "c", "v", "y" -> pathRect = null
                     "BT" -> { textMatrix = Mat.IDENTITY; lineMatrix = Mat.IDENTITY }
                     "ET" -> { /* 无需特殊处理，文本状态在下一个 BT 前保留也不会被读取 */ }
                     "Tm" -> if (operands.size >= 6) {

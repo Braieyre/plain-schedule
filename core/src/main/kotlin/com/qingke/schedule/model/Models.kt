@@ -2,6 +2,9 @@ package com.qingke.schedule.model
 
 import kotlinx.serialization.Serializable
 
+/** PDF 视图坐标下的矩形区域。 */
+data class SpanBounds(val left: Float, val bottom: Float, val right: Float, val top: Float)
+
 /**
  * 从 PDF 内容流里抽出的一段文字及其视图坐标。
  * 坐标已经过 CTM 与页面 /Rotate 归一，原点左下、y 向上。
@@ -14,6 +17,11 @@ data class Span(
     val y: Float,
     val size: Float,
     val text: String,
+    /** 文字在页面上的宽度，未知时为 0；用于还原逐字输出的英文词间空格。 */
+    val width: Float = 0f,
+    /** 矩形裁剪区域，可用来分开紧邻甚至在内容流中重叠的表格行。 */
+    val clip: SpanBounds? = null,
+    val glyphKey: String? = null,
 )
 
 /** 有固定周几 + 节次的课。 */

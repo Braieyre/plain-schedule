@@ -11,8 +11,8 @@ android {
         applicationId = "com.qingke.schedule"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
         vectorDrawables { useSupportLibrary = true }
     }
     buildTypes {
@@ -35,6 +35,7 @@ android {
 }
 dependencies {
     implementation(project(":core"))
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     implementation(libs.kotlinx.serialization.json)
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
