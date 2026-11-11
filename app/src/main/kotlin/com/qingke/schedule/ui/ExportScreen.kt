@@ -5,6 +5,7 @@ import android.content.Intent
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -57,7 +58,7 @@ fun ExportScreen(onBack: () -> Unit) {
         ScheduleTransfer.encode(data, state.settings.periodTimes).also { error = null }
     } catch (e: Exception) { error = e.message ?: "无法导出课表"; null }
 
-    Column(Modifier.fillMaxSize().systemBarsPadding()) {
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).systemBarsPadding()) {
         Row(Modifier.fillMaxWidth().height(56.dp)) {
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回") }
             Text("导出课表", Modifier.padding(top = 12.dp), style = MaterialTheme.typography.titleLarge)

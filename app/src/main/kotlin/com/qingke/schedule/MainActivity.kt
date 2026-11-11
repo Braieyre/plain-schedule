@@ -25,9 +25,10 @@ sealed interface Screen {
     data object Schedule : Screen
     data object Export : Screen
     data object Import : Screen
+    data object Pending : Screen
     data object PeriodTimes : Screen
     data object Appearance : Screen
-    data class Edit(val course: Course?) : Screen
+    data class Edit(val course: Course?, val week: Int? = null, val draft: Course? = null) : Screen
 }
 
 class MainActivity : ComponentActivity() {
@@ -75,14 +76,16 @@ private fun AppRoot() {
         when (val s = screen) {
             Screen.Schedule -> ScheduleScreen(
                 onOpenDrawer = { scope.launch { drawer.open() } },
-                onAddCourse = { screen = Screen.Edit(null) },
-                onEditCourse = { screen = Screen.Edit(it) },
+                onAddCourse = { week -> screen = Screen.Edit(null, week) },
+                onPending = { screen = Screen.Pending },
+                onEditCourse = { course, week -> screen = Screen.Edit(course, week) },
             )
+            Screen.Pending -> PendingCoursesScreen(onBack = { screen = Screen.Schedule }, onFill = { draft -> screen = Screen.Edit(null, draft = draft) })
             Screen.Export -> ExportScreen(onBack = { screen = Screen.Schedule })
             Screen.Import -> ImportScreen(onBack = { screen = Screen.Schedule })
             Screen.PeriodTimes -> PeriodTimesScreen(onBack = { screen = Screen.Schedule })
             Screen.Appearance -> AppearanceScreen(onBack = { screen = Screen.Schedule })
-            is Screen.Edit -> CourseEditScreen(existing = s.course, onDone = { screen = Screen.Schedule })
+            is Screen.Edit -> CourseEditScreen(existing = s.course, onDone = { screen = Screen.Schedule }, initialWeek = s.week, draft = s.draft)
         }
     }
 }

@@ -71,12 +71,21 @@ data class Semester(
     val totalWeeks: Int,
 )
 
+/** 未能从原文件读到完整周次的安排，补齐前不进入周视图。 */
+@Serializable
+data class PendingCourse(
+    val id: String, val name: String, val day: Int,
+    val startPeriod: Int? = null, val endPeriod: Int? = null,
+    val sourcePage: Int? = null, val rawText: String = "",
+)
+
 /** 落盘到 filesDir/schedule.json 的完整课表。 */
 @Serializable
 data class ScheduleData(
     val semester: Semester,
     val courses: List<Course> = emptyList(),
     val flexCourses: List<FlexCourse> = emptyList(),
+    val pendingCourses: List<PendingCourse> = emptyList(),
 )
 
 /** ScheduleParser 的输出。开学日期不在 PDF 里，由用户在导入时补。 */
@@ -86,6 +95,7 @@ data class ParseResult(
     val flexCourses: List<FlexCourse>,
     val maxWeek: Int,
     val warnings: List<String> = emptyList(),
+    val pendingCourses: List<PendingCourse> = emptyList(),
 )
 
 /**

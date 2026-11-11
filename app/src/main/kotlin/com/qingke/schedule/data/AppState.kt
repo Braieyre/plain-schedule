@@ -59,8 +59,8 @@ class AppState(private val store: Store) {
     }
 
     fun replaceSchedule(data: ScheduleData?) {
-        schedule = data
         store.saveSchedule(data)
+        schedule = data
     }
 
     /** 导入解析结果，覆盖现有课表。[startMonday] 由调用方保证已对齐周一。 */
@@ -74,6 +74,7 @@ class AppState(private val store: Store) {
                 ),
                 courses = result.courses,
                 flexCourses = result.flexCourses,
+                pendingCourses = result.pendingCourses,
             )
         )
     }
@@ -93,9 +94,15 @@ class AppState(private val store: Store) {
         replaceSchedule(
             cur.copy(
                 courses = list.sortedWith(compareBy({ it.day }, { it.startPeriod })),
+                pendingCourses = cur.pendingCourses.filterNot { it.id == course.id },
                 semester = cur.semester.copy(totalWeeks = maxOf(maxWeek, cur.semester.totalWeeks)),
             )
         )
+    }
+
+    fun changeCourse(original: Course, sourceWeeks: Set<Int>, replacement: Course?) {
+        val cur = schedule ?: return
+        replaceSchedule(com.qingke.schedule.CourseChanges.apply(cur, original.id, sourceWeeks, replacement))
     }
 
     fun deleteCourse(id: String) {

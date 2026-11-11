@@ -76,6 +76,9 @@ import com.qingke.schedule.model.Course
 import com.qingke.schedule.model.FlexCourse
 import com.qingke.schedule.transfer.ScheduleArchive
 import com.qingke.schedule.transfer.ScheduleTransfer
+import com.qingke.schedule.model.PeriodTime
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.qingke.schedule.model.ParseResult
 import com.qingke.schedule.model.PdfUnsupportedException
 import kotlinx.coroutines.CancellationException
@@ -144,6 +147,8 @@ fun ImportScreen(onBack: () -> Unit) {
     var step by remember { mutableStateOf<ImportStep>(ImportStep.Pick) }
     var pickedUri by remember { mutableStateOf<Uri?>(null) }
     var parseJobId by remember { mutableStateOf(0) }
+    var previewTimes by remember { mutableStateOf(appState.settings.periodTimes) }
+    var showTimes by remember { mutableStateOf(false) }
     var importedArchive by remember { mutableStateOf<ScheduleArchive?>(null) }
     var pickError by remember { mutableStateOf<String?>(null) }
 
@@ -212,9 +217,10 @@ fun ImportScreen(onBack: () -> Unit) {
                     val archive = ScheduleTransfer.decode(bytes.toString(Charsets.UTF_8))
                     val data = archive.schedule
                     ParseResult(data.semester.title, data.courses, data.flexCourses, data.semester.totalWeeks,
-                        listOf(if (archive.periodTimes != null) "将同步导入文件中的上课时间" else "文件不含上课时间，将保留本机设置")) to archive
+                        listOf(if (archive.periodTimes != null) "将同步导入文件中的上课时间" else "文件不含上课时间，将保留本机设置"), data.pendingCourses) to archive
                 }
             }
+            previewTimes = result.second?.periodTimes ?: appState.settings.periodTimes
             importedArchive = result.second
             result.second?.let {
                 dateMethod = 2
@@ -240,7 +246,7 @@ fun ImportScreen(onBack: () -> Unit) {
         is ImportStep.Confirm -> 4 to "确认导入"
     }
 
-    Column(Modifier.fillMaxSize().systemBarsPadding()) {
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).systemBarsPadding()) {
         TopBar(title = "导入课表", onBack = onBack)
         Text(
             "步骤 $stepIndex/4 · $stepLabel",
@@ -272,6 +278,8 @@ fun ImportScreen(onBack: () -> Unit) {
                 is ImportStep.Preview -> PreviewContent(
                     result = currentStep.result,
                     palette = palette,
+                    periodTimes = previewTimes,
+                    onEditTimes = { showTimes = true },
                     dateMethod = dateMethod,
                     onDateMethodChange = { dateMethod = it },
                     weekNumberText = weekNumberText,
@@ -292,9 +300,10 @@ fun ImportScreen(onBack: () -> Unit) {
                         val archive = importedArchive
                         if (archive != null) {
                             appState.replaceSchedule(archive.schedule.copy(semester = archive.schedule.semester.copy(startMonday = computedMonday.toString())))
-                            archive.periodTimes?.let { times -> appState.updateSettings { it.copy(periodTimes = times) } }
+                            appState.updateSettings { it.copy(periodTimes = previewTimes) }
                         } else {
                             appState.importResult(currentStep.result, computedMonday)
+                            appState.updateSettings { it.copy(periodTimes = previewTimes) }
                         }
                         onBack()
                     },
@@ -303,6 +312,13 @@ fun ImportScreen(onBack: () -> Unit) {
         }
     }
 
+    if (showTimes) {
+        Dialog(onDismissRequest = { showTimes = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Surface(Modifier.fillMaxSize()) {
+                PeriodTimesScreen(onBack = { showTimes = false }, periodTimes = previewTimes, onUpdate = { previewTimes = it })
+            }
+        }
+    }
     if (showDatePicker) {
         // 限制年份范围为当前年份 ±2 年，防止用户误选导致导入后日期离谱。
         val currentYear = LocalDate.now().year
@@ -417,6 +433,8 @@ private fun FailedContent(reason: String, rawText: String, onRetry: () -> Unit) 
 private fun PreviewContent(
     result: ParseResult,
     palette: CoursePalette,
+    periodTimes: List<PeriodTime>,
+    onEditTimes: () -> Unit,
     dateMethod: Int,
     onDateMethodChange: (Int) -> Unit,
     weekNumberText: String,
@@ -427,6 +445,8 @@ private fun PreviewContent(
     onReChoose: () -> Unit,
     onNext: () -> Unit,
 ) {
+    var showWarnings by remember(result) { mutableStateOf(false) }
+    var query by remember(result) { mutableStateOf("") }
     val practiceCount = result.flexCourses.count { it.kind == "实践" }
     val otherCount = result.flexCourses.size - practiceCount
     val summary = buildString {
@@ -449,6 +469,17 @@ private fun PreviewContent(
                 )
             }
         }
+        item {
+            OutlinedTextField(value = query, onValueChange = { query = it }, singleLine = true,
+                label = { Text("查找课程") }, placeholder = { Text("输入课程名核对是否已识别") }, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = onEditTimes, modifier = Modifier.fillMaxWidth()) {
+                Text("上课时间 · ${periodTimes.firstOrNull()?.start.orEmpty()} 起 · 点击按学校修改")
+            }
+            if (result.pendingCourses.isNotEmpty()) Text(
+                "${result.pendingCourses.size} 条安排缺少周次，导入后可在首页补充：" + result.pendingCourses.joinToString("、") { it.name },
+                style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical = 8.dp))
+        }
         if (result.warnings.isNotEmpty()) {
             item {
                 Surface(
@@ -458,11 +489,12 @@ private fun PreviewContent(
                 ) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text(
-                            "解析提示",
+                            "有 ${result.warnings.size} 条识别提示",
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onTertiaryContainer,
                         )
-                        result.warnings.forEach { w ->
+                        TextButton(onClick = { showWarnings = !showWarnings }) { Text(if (showWarnings) "收起详情" else "查看详情") }
+                        if (showWarnings) result.warnings.forEach { w ->
                             Text(
                                 "• $w",
                                 style = MaterialTheme.typography.bodySmall,
@@ -473,7 +505,10 @@ private fun PreviewContent(
                 }
             }
         }
-        items(result.courses, key = { it.id }) { c -> CourseRow(c, palette) }
+        items(result.courses.filter { it.name.contains(query.trim(), ignoreCase = true) }, key = { it.id }) { c -> CourseRow(c, palette) }
+        if (query.isNotBlank() && result.courses.none { it.name.contains(query.trim(), ignoreCase = true) }) {
+            item { Text("没有找到已识别的上课安排，请查看待补充安排或导入后手动添加。", modifier = Modifier.padding(12.dp)) }
+        }
         if (result.flexCourses.isNotEmpty()) {
             item {
                 Text(

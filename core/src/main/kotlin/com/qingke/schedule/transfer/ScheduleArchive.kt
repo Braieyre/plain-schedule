@@ -57,7 +57,7 @@ object ScheduleTransfer {
         val date = runCatching { LocalDate.parse(semester.startMonday) }.getOrNull()
         require(date != null && date.dayOfWeek == DayOfWeek.MONDAY) { "开学日期必须是有效的周一" }
         require(data.courses.size + data.flexCourses.size <= 2000) { "课程数量过多" }
-        val ids = data.courses.map { it.id } + data.flexCourses.map { it.id }
+        val ids = data.courses.map { it.id } + data.flexCourses.map { it.id } + data.pendingCourses.map { it.id }
         require(ids.all { it.isNotBlank() } && ids.distinct().size == ids.size) { "课程编号为空或重复" }
         fun checkCourse(name: String, weeks: List<Int>) {
             require(name.isNotBlank() && name.length <= 500) { "课程名称无效" }
@@ -71,6 +71,12 @@ object ScheduleTransfer {
             }
         }
         data.flexCourses.forEach { checkCourse(it.name, it.weeks) }
+        require(data.pendingCourses.size <= 2000) { "待补充安排数量过多" }
+        data.pendingCourses.forEach {
+            require(it.name.isNotBlank() && it.name.length <= 500 && it.day in 1..7) { "待补充安排的名称或星期无效" }
+            require((it.startPeriod == null && it.endPeriod == null) ||
+                (it.startPeriod != null && it.endPeriod != null && it.startPeriod in 1..12 && it.endPeriod in it.startPeriod..12)) { "待补充安排的节次无效" }
+        }
         archive.periodTimes?.let { times ->
             require(times.map { it.index }.sorted() == (1..12).toList()) { "上课时间必须包含第 1～12 节且不能重复" }
             times.forEach {

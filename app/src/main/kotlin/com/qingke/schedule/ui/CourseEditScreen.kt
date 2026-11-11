@@ -39,6 +39,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.qingke.schedule.model.Course
+import com.qingke.schedule.CourseChanges
+import java.util.UUID
 
 /** 周几芯片标签，与 Course.day（1=周一…7=周日）一一对应。 */
 private val WEEKDAY_LABELS = listOf("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -51,35 +53,47 @@ private val MARKER_OPTIONS = listOf("★", "●", "▲", "■", "无")
  * 全屏表单：顶栏固定，中间内容整体可滚动，避开系统栏与输入法。
  */
 @Composable
-fun CourseEditScreen(existing: Course?, onDone: () -> Unit) {
+fun CourseEditScreen(existing: Course?, onDone: () -> Unit, initialWeek: Int? = null, draft: Course? = null) {
     val state = LocalAppState.current
     val totalWeeks = state.totalWeeks
 
-    var name by remember(existing) { mutableStateOf(existing?.name ?: "") }
-    var day by remember(existing) { mutableStateOf(existing?.day?.coerceIn(1, 7) ?: 1) }
-    var startPeriod by remember(existing) { mutableStateOf(existing?.startPeriod?.coerceIn(1, 12) ?: 1) }
-    var endPeriod by remember(existing) {
+    val seed = existing ?: draft
+    val selectedWeek = (initialWeek ?: state.currentWeek()).coerceIn(1, totalWeeks)
+    var scopeMode by remember(existing) { mutableStateOf(if (existing != null && selectedWeek in existing.weeks) 0 else 2) }
+    fun sourceWeeks(mode: Int = scopeMode): Set<Int> = existing?.weeks.orEmpty().filter {
+        when (mode) { 0 -> it == selectedWeek; 1 -> it >= selectedWeek; else -> true }
+    }.toSet()
+    var name by remember(seed) { mutableStateOf(seed?.name ?: "") }
+    var day by remember(seed) { mutableStateOf(seed?.day?.coerceIn(1, 7) ?: 1) }
+    var startPeriod by remember(seed) { mutableStateOf(seed?.startPeriod?.coerceIn(1, 12) ?: 1) }
+    var endPeriod by remember(seed) {
         // 用 existing 的起止节次算初值；万一存量数据脏了（end < start），直接钳成合法值，
         // 后面 PeriodStepper 的 range 会持续维护 1 <= start <= end <= 12 这条不变式。
-        val s = existing?.startPeriod?.coerceIn(1, 12) ?: 1
-        val e = (existing?.endPeriod ?: s).coerceIn(1, 12)
+        val s = seed?.startPeriod?.coerceIn(1, 12) ?: 1
+        val e = (seed?.endPeriod ?: s).coerceIn(1, 12)
         mutableStateOf(maxOf(e, s))
     }
-    var weeks by remember(existing) { mutableStateOf(existing?.weeks?.toSet() ?: emptySet()) }
-    var room by remember(existing) { mutableStateOf(existing?.room ?: "") }
-    var teachersText by remember(existing) { mutableStateOf(existing?.teachers?.joinToString("、") ?: "") }
-    var examText by remember(existing) { mutableStateOf(existing?.exam ?: "") }
-    var marker by remember(existing) { mutableStateOf(existing?.marker?.takeIf { it.isNotEmpty() } ?: "无") }
+    var weeks by remember(seed) { mutableStateOf(if (existing != null) sourceWeeks() else seed?.weeks?.toSet() ?: setOf(selectedWeek)) }
+    var room by remember(seed) { mutableStateOf(seed?.room ?: "") }
+    var teachersText by remember(seed) { mutableStateOf(seed?.teachers?.joinToString("、") ?: "") }
+    var examText by remember(seed) { mutableStateOf(seed?.exam ?: "") }
+    var marker by remember(seed) { mutableStateOf(seed?.marker?.takeIf { it.isNotEmpty() } ?: "无") }
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
     val canSave = name.isNotBlank() && weeks.isNotEmpty()
 
+    var conflictCourse by remember { mutableStateOf<Course?>(null) }
+    var conflictNames by remember { mutableStateOf("") }
+    fun commit(course: Course) {
+        if (existing != null) state.changeCourse(existing, sourceWeeks(), course) else state.upsertCourse(course)
+        onDone()
+    }
     fun save() {
         if (!canSave) return
         val trimmedName = name.trim()
         val course = Course(
-            // 新增用确定性 id，与 T2 解析器保持一致；编辑沿用原 id，upsertCourse 才会覆盖而不是新增一条。
-            id = existing?.id ?: "$day-$startPeriod-$trimmedName",
+            // 新增加课使用独立 ID，同名、同节次的临时课不能覆盖已有安排。
+            id = seed?.id ?: UUID.randomUUID().toString(),
             name = trimmedName,
             marker = if (marker == "无") "" else marker,
             day = day,
@@ -90,8 +104,11 @@ fun CourseEditScreen(existing: Course?, onDone: () -> Unit) {
             teachers = splitTeachers(teachersText),
             exam = examText.trim().ifBlank { null },
         )
-        state.upsertCourse(course)
-        onDone()
+        val conflicts = CourseChanges.conflicts(state.schedule, course, existing, sourceWeeks())
+        if (conflicts.isNotEmpty()) {
+            conflictNames = conflicts.map { it.name }.distinct().joinToString("、")
+            conflictCourse = course
+        } else commit(course)
     }
 
     Column(
@@ -132,6 +149,25 @@ fun CourseEditScreen(existing: Course?, onDone: () -> Unit) {
                 .imePadding()
                 .padding(horizontal = 20.dp, vertical = 16.dp),
         ) {
+            if (existing != null) {
+                FieldLabel("调整范围")
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("仅第 $selectedWeek 周", "从第 $selectedWeek 周起", "全部周次").forEachIndexed { mode, label ->
+                        FilterChip(selected = scopeMode == mode, enabled = sourceWeeks(mode).isNotEmpty(), onClick = {
+                            scopeMode = mode
+                            weeks = sourceWeeks(mode)
+                        }, label = { Text(label) })
+                    }
+                }
+                Text("只替换原安排在所选范围内的周次；其他周不变。", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.height(16.dp))
+            } else if (draft != null) {
+                Text("请选择这条安排实际开课的周次，再保存。", color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(16.dp))
+            } else {
+                Text("临时加课默认只在第 $selectedWeek 周生效，也可在下方选择多周。", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.height(16.dp))
+            }
             FieldLabel("课名")
             OutlinedTextField(
                 value = name,
@@ -237,15 +273,21 @@ fun CourseEditScreen(existing: Course?, onDone: () -> Unit) {
         }
     }
 
+    conflictCourse?.let { candidate ->
+        AlertDialog(onDismissRequest = { conflictCourse = null }, title = { Text("上课时间冲突") },
+            text = { Text("与「$conflictNames」的部分周次和节次重叠，仍然保存吗？") },
+            confirmButton = { TextButton(onClick = { conflictCourse = null; commit(candidate) }) { Text("仍然保存") } },
+            dismissButton = { TextButton(onClick = { conflictCourse = null }) { Text("返回调整") } })
+    }
     if (showDeleteConfirm && existing != null) {
         AlertDialog(
             onDismissRequest = { showDeleteConfirm = false },
             title = { Text("删除课程") },
-            text = { Text("确定删除「${existing.displayName}」吗？此操作不可撤销。") },
+            text = { Text("将取消「${existing.displayName}」在 ${com.qingke.schedule.WeekMath.formatWeekRanges(sourceWeeks().sorted())} 的安排，其他周保持不变。") },
             confirmButton = {
                 TextButton(onClick = {
                     showDeleteConfirm = false
-                    state.deleteCourse(existing.id)
+                    state.changeCourse(existing, sourceWeeks(), null)
                     onDone()
                 }) { Text("删除", color = MaterialTheme.colorScheme.error) }
             },

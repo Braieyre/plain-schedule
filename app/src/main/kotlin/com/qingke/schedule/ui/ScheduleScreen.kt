@@ -40,6 +40,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -88,8 +89,9 @@ private val PeriodRowHeight = 84.dp
 @Composable
 fun ScheduleScreen(
     onOpenDrawer: () -> Unit,
-    onAddCourse: () -> Unit,
-    onEditCourse: (Course) -> Unit,
+    onAddCourse: (Int) -> Unit,
+    onEditCourse: (Course, Int) -> Unit,
+    onPending: () -> Unit,
 ) {
     val state = LocalAppState.current
     val settings = state.settings
@@ -106,6 +108,7 @@ fun ScheduleScreen(
                     onOpenDrawer = onOpenDrawer,
                     onAddCourse = onAddCourse,
                     onEditCourse = onEditCourse,
+                    onPending = onPending,
                 )
             }
         }
@@ -166,8 +169,9 @@ private fun EmptyScheduleState(onOpenDrawer: () -> Unit) {
 private fun ScheduleContent(
     state: AppState,
     onOpenDrawer: () -> Unit,
-    onAddCourse: () -> Unit,
-    onEditCourse: (Course) -> Unit,
+    onAddCourse: (Int) -> Unit,
+    onEditCourse: (Course, Int) -> Unit,
+    onPending: () -> Unit,
 ) {
     val settings = state.settings
     val totalWeeks = state.totalWeeks
@@ -200,9 +204,14 @@ private fun ScheduleContent(
                 totalWeeks = totalWeeks,
                 subtitle = state.semester?.title.orEmpty(),
                 onOpenDrawer = onOpenDrawer,
-                onAddCourse = onAddCourse,
+                onAddCourse = { onAddCourse(displayedWeek) },
                 onPickWeek = { w -> scope.launch { pagerState.animateScrollToPage(w - 1) } },
             )
+            if (state.schedule?.pendingCourses?.isNotEmpty() == true) {
+                TextButton(onClick = onPending, modifier = Modifier.fillMaxWidth()) {
+                    Text("${state.schedule!!.pendingCourses.size} 条安排待补充周次 · 点击处理")
+                }
+            }
             DateHeaderRow(
                 startMonday = state.startMonday,
                 week = displayedWeek,
@@ -246,7 +255,7 @@ private fun ScheduleContent(
             course = course,
             onDismiss = { selectedCourse = null },
             onEdit = {
-                onEditCourse(course)
+                onEditCourse(course, displayedWeek)
                 selectedCourse = null
             },
         )

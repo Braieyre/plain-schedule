@@ -2,6 +2,7 @@ package com.qingke.schedule.parse
 
 import com.qingke.schedule.model.Course
 import com.qingke.schedule.model.ParseResult
+import com.qingke.schedule.model.PendingCourse
 import com.qingke.schedule.model.Span
 import com.qingke.schedule.model.SpanBounds
 import kotlin.math.abs
@@ -18,6 +19,7 @@ internal object MultiCourseTableParser {
     fun parse(spans: List<Span>): ParseResult? {
         var previousHeaders = emptyList<Header>()
         val courses = mutableListOf<Course>()
+        val pending = mutableListOf<PendingCourse>()
         val warnings = mutableListOf<String>()
         var title: String? = null
         var matched = false
@@ -121,7 +123,14 @@ internal object MultiCourseTableParser {
                         }
                     }
                     val tail = logical.drop(cursor).filter { it.isNotBlank() }
-                    if (tail.isNotEmpty()) warnings += "第 $page 页星期${dayName(header.day)}末尾仍有不完整安排，未导入：${tail.joinToString(" ").take(100)}"
+                    if (tail.isNotEmpty()) {
+                        warnings += "第 $page 页星期${dayName(header.day)}末尾仍有不完整安排，未导入：${tail.joinToString(" ").take(100)}"
+                        val name = tail.first()
+                        if (!looksLikeRoom(name) && ';' !in name && name.any { it.isLetter() }) {
+                            pending += PendingCourse("pending-${pending.size}", name, header.day,
+                                rowHint?.start, rowHint?.end, page, tail.joinToString("\n"))
+                        }
+                    }
                 }
             }
         }
@@ -130,7 +139,7 @@ internal object MultiCourseTableParser {
         val unique = courses.distinctBy { listOf(it.name, it.day, it.startPeriod, it.endPeriod, it.weeks, it.room, it.teachers) }
             .mapIndexed { index, c -> c.copy(id = "import-$index") }
         return ParseResult(title, unique, emptyList(), unique.flatMap { it.weeks }.maxOrNull() ?: 1,
-            (listOf("已识别同格多门课程；原 PDF 页末可能截断内容，请结合下方提示逐项核对") + warnings).distinct())
+            (listOf("已识别同格多门课程；原 PDF 页末可能截断内容，请结合下方提示逐项核对") + warnings).distinct(), pending.distinctBy { listOf(it.name, it.day, it.startPeriod, it.endPeriod) })
     }
 
     private fun dayName(day: Int) = "一二三四五六日"[day - 1]

@@ -42,9 +42,14 @@ import com.qingke.schedule.model.PeriodTime
 
 /** T5 实现：编辑每节课的起止时间（抽屉「上课时间」入口指向此页）。 */
 @Composable
-fun PeriodTimesScreen(onBack: () -> Unit) {
+fun PeriodTimesScreen(
+    onBack: () -> Unit,
+    periodTimes: List<PeriodTime>? = null,
+    onUpdate: ((List<PeriodTime>) -> Unit)? = null,
+) {
     val state = LocalAppState.current
-    val settings = state.settings
+    val settings = state.settings.copy(periodTimes = periodTimes ?: state.settings.periodTimes)
+    fun update(times: List<PeriodTime>) { if (onUpdate != null) onUpdate(times) else state.updateSettings { it.copy(periodTimes = times) } }
     // 正常情况下有 12 节；即便被改成别的长度，也只按现有条目渲染，不假设固定 12 项，避免崩溃。
     val periods = remember(settings.periodTimes) { settings.periodTimes.sortedBy { it.index } }
 
@@ -124,8 +129,12 @@ fun PeriodTimesScreen(onBack: () -> Unit) {
                         else -> pt.copy(end = newTime)
                     }
                 }
-                state.updateSettings { it.copy(periodTimes = updated) }
-                editing = null
+                val changed = updated.first { it.index == target.periodIndex }
+                if (changed.start >= changed.end) false else {
+                    update(updated)
+                    editing = null
+                    true
+                }
             },
             onDismiss = { editing = null },
         )
@@ -138,7 +147,7 @@ fun PeriodTimesScreen(onBack: () -> Unit) {
             text = { Text("将把全部节次的上下课时间恢复为系统默认值，确定继续吗？") },
             confirmButton = {
                 TextButton(onClick = {
-                    state.updateSettings { it.copy(periodTimes = DEFAULT_PERIOD_TIMES) }
+                    update(DEFAULT_PERIOD_TIMES)
                     showResetConfirm = false
                 }) { Text("恢复默认") }
             },
@@ -203,7 +212,7 @@ private fun parseHm(text: String): Pair<Int, Int> {
 private fun AppTimePickerDialog(
     title: String,
     initial: String,
-    onConfirm: (String) -> Unit,
+    onConfirm: (String) -> Boolean,
     onDismiss: () -> Unit,
 ) {
     val (initialHour, initialMinute) = remember(initial) { parseHm(initial) }
@@ -212,16 +221,20 @@ private fun AppTimePickerDialog(
         initialMinute = initialMinute,
         is24Hour = true,
     )
+    var invalid by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                TimePicker(state = state)
+                androidx.compose.foundation.layout.Column {
+                    TimePicker(state = state)
+                    if (invalid) Text("开始时间必须早于结束时间；必要时先修改另一端。", color = MaterialTheme.colorScheme.error)
+                }
             }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm("%02d:%02d".format(state.hour, state.minute)) }) {
+            TextButton(onClick = { invalid = !onConfirm("%02d:%02d".format(state.hour, state.minute)) }) {
                 Text("确定")
             }
         },

@@ -61,6 +61,8 @@ class MultiCourseTableParserTest {
         val result = ScheduleParser.parse(headers() + course("完整课", "1-8周", "1-2节", 650f) + span("被截断课程\u0001", 500f))
         assertEquals(1, result.courses.size)
         assertTrue(result.warnings.any { "被截断课程" in it })
+        assertEquals("被截断课程", result.pendingCourses.single().name)
+        assertEquals(1, result.pendingCourses.single().day)
     }
 
     @Test fun `异常字符明确标记且不影响其余字段`() {

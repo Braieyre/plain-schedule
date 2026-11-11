@@ -134,7 +134,11 @@ fun AppTheme(settings: Settings, content: @Composable () -> Unit) {
     val dark = isAppInDarkTheme(settings)
     MaterialTheme(
         colorScheme = if (dark) DarkScheme else LightScheme,
-        content = content,
+        content = {
+            androidx.compose.runtime.CompositionLocalProvider(
+                androidx.compose.material3.LocalContentColor provides (if (dark) DarkScheme else LightScheme).onBackground,
+            ) { content() }
+        },
     )
 }
 
